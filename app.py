@@ -5,7 +5,6 @@ from transformers import pipeline
 
 DATA_DIR = "data"
 
-
 # -------------------------
 # Caching
 # -------------------------
@@ -16,29 +15,39 @@ def load_csv(path: str) -> pd.DataFrame:
 
 @st.cache_resource
 def load_sentiment_model():
-    # rubric-friendly model
+    # Hugging Face Transformer model (po navodilih)
     return pipeline(
         "sentiment-analysis",
         model="distilbert-base-uncased-finetuned-sst-2-english",
+        device=-1  # CPU (Render free)
     )
 
 
-@st.cache_data(show_spinner=False)
-def run_sentiment_cached(month_label: str, texts: list[str]) -> pd.DataFrame:
+# -------------------------
+# Sentiment (RAM-safe)
+# -------------------------
+def run_sentiment_chunked(texts: list[str], chunk_size: int = 40) -> pd.DataFrame:
     """
-    Cache predictions per month to avoid re-running on every Streamlit rerun.
-    Returns a DataFrame with sentiment + confidence aligned to texts.
+    Chunked sentiment inference to avoid exceeding 512MB RAM on Render.
+    No Streamlit caching of predictions.
     """
     pipe = load_sentiment_model()
-    preds = pipe(texts, batch_size=16, truncation=True)
+    rows = []
 
-    out = pd.DataFrame(
-        {
-            "sentiment": [p.get("label", "") for p in preds],
-            "confidence": [float(p.get("score", 0.0)) for p in preds],
-        }
-    )
-    return out
+    for i in range(0, len(texts), chunk_size):
+        chunk = texts[i:i + chunk_size]
+        preds = pipe(
+            chunk,
+            batch_size=4,
+            truncation=True,
+            max_length=128,
+        )
+        rows.extend(preds)
+
+    return pd.DataFrame({
+        "sentiment": [p.get("label", "") for p in rows],
+        "confidence": [float(p.get("score", 0.0)) for p in rows],
+    })
 
 
 # -------------------------
@@ -76,7 +85,8 @@ st.set_page_config(page_title="HW3 Brand Reputation Monitor (2023)", layout="wid
 
 st.title("Brand Reputation Monitor (2023)")
 st.caption(
-    "Scrapes Products/Testimonials/Reviews from web-scraping.dev, runs Transformer sentiment analysis on 2023 reviews."
+    "Scrapes Products/Testimonials/Reviews from web-scraping.dev, "
+    "runs Hugging Face Transformer sentiment analysis on 2023 reviews."
 )
 
 section = st.sidebar.radio("Navigate", ["Products", "Testimonials", "Reviews"])
@@ -86,7 +96,7 @@ products_df = load_csv(f"{DATA_DIR}/products.csv")
 testimonials_df = load_csv(f"{DATA_DIR}/testimonials.csv")
 reviews_df = load_csv(f"{DATA_DIR}/reviews.csv")
 
-# Normalize reviews date column
+# Normalize review dates
 if "date" in reviews_df.columns:
     reviews_df["date"] = pd.to_datetime(reviews_df["date"], errors="coerce")
 elif "date_raw" in reviews_df.columns:
@@ -97,6 +107,7 @@ else:
 # Ensure text/title columns exist
 if "text" not in reviews_df.columns:
     reviews_df["text"] = ""
+
 if "title" not in reviews_df.columns:
     reviews_df["title"] = (
         reviews_df["text"]
@@ -125,40 +136,38 @@ elif section == "Testimonials":
 else:
     st.subheader("Reviews — Sentiment Analysis (2023)")
 
-    # Month selector (rubric-safe toggle)
     show_all = st.checkbox("Show all months (Jan–Dec 2023)", value=False)
     months = month_options_2023() if show_all else available_months_from_data(reviews_df)
 
     selected = st.select_slider("Select month", options=months, value=months[0])
     start, end = month_to_range(selected)
 
-    # Filter reviews for selected month
-    filtered = reviews_df[(reviews_df["date"] >= start) & (reviews_df["date"] < end)].copy()
-    filtered = filtered.dropna(subset=["date"])
+    filtered = reviews_df[
+        (reviews_df["date"] >= start) & (reviews_df["date"] < end)
+    ].copy()
+
     filtered["text"] = filtered["text"].fillna("").astype(str)
 
     st.write(f"Showing reviews from **{selected}** — rows: **{len(filtered)}**")
 
-    if len(filtered) == 0:
-        st.warning("No reviews found for this month in your dataset.")
+    if filtered.empty:
+        st.warning("No reviews found for this month.")
         st.stop()
 
-    # ✅ IMPORTANT: don't load/run model automatically (saves Render memory)
     run_now = st.button("Run sentiment analysis for this month")
 
     if not run_now:
-        st.info("Click the button to run sentiment analysis. (Helps avoid memory crashes on free hosting.)")
+        st.info("Click the button to run sentiment analysis.")
         st.stop()
 
-    # Run sentiment with caching
     with st.spinner("Running sentiment analysis..."):
-        pred_df = run_sentiment_cached(selected, filtered["text"].tolist())
+        pred_df = run_sentiment_chunked(filtered["text"].tolist())
 
     filtered = filtered.reset_index(drop=True)
     filtered["sentiment"] = pred_df["sentiment"]
     filtered["confidence"] = pred_df["confidence"]
 
-    # Summary stats (count + avg confidence per sentiment)
+    # Summary
     summary = (
         filtered.groupby("sentiment")
         .agg(
@@ -168,34 +177,32 @@ else:
         .reset_index()
     )
 
-    avg_conf_overall = filtered["confidence"].mean()
-    avg_conf_by_class = summary[["sentiment", "avg_confidence"]].copy()
-
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total reviews", f"{len(filtered)}")
-    c2.metric("Avg confidence (overall)", f"{avg_conf_overall:.3f}")
-    c3.metric("Positive share", f"{(filtered['sentiment'].eq('POSITIVE').mean() * 100):.1f}%")
+    c1.metric("Total reviews", len(filtered))
+    c2.metric("Avg confidence", f"{filtered['confidence'].mean():.3f}")
+    c3.metric("Positive share", f"{filtered['sentiment'].eq('POSITIVE').mean()*100:.1f}%")
 
-    # Bar chart with tooltip that includes avg confidence (Advanced requirement)
+    # Bar chart (Advanced requirement)
     chart = (
         alt.Chart(summary)
         .mark_bar()
         .encode(
-            x=alt.X("sentiment:N", title="Sentiment"),
-            y=alt.Y("count:Q", title="Count"),
+            x="sentiment:N",
+            y="count:Q",
             tooltip=[
-                alt.Tooltip("sentiment:N", title="Sentiment"),
-                alt.Tooltip("count:Q", title="Count"),
-                alt.Tooltip("avg_confidence:Q", title="Avg confidence", format=".3f"),
+                "sentiment:N",
+                "count:Q",
+                alt.Tooltip("avg_confidence:Q", format=".3f")
             ],
         )
         .properties(height=300)
     )
+
     st.altair_chart(chart, width="stretch")
 
-    st.markdown("**Average confidence by class**")
-    st.dataframe(avg_conf_by_class, width="stretch")
-
     st.markdown("**Filtered reviews (with predictions)**")
-    show_cols = ["date", "title", "text", "sentiment", "confidence"]
-    st.dataframe(filtered[show_cols].sort_values("date", ascending=False), width="stretch")
+    st.dataframe(
+        filtered[["date", "title", "text", "sentiment", "confidence"]]
+        .sort_values("date", ascending=False),
+        width="stretch",
+    )
