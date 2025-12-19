@@ -23,6 +23,24 @@ def load_sentiment_model():
     )
 
 
+@st.cache_data(show_spinner=False)
+def run_sentiment_cached(month_label: str, texts: list[str]) -> pd.DataFrame:
+    """
+    Cache predictions per month to avoid re-running on every Streamlit rerun.
+    Returns a DataFrame with sentiment + confidence aligned to texts.
+    """
+    pipe = load_sentiment_model()
+    preds = pipe(texts, batch_size=16, truncation=True)
+
+    out = pd.DataFrame(
+        {
+            "sentiment": [p.get("label", "") for p in preds],
+            "confidence": [float(p.get("score", 0.0)) for p in preds],
+        }
+    )
+    return out
+
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -49,10 +67,6 @@ def month_to_range(label: str):
     start = pd.to_datetime(label)
     end = start + pd.offsets.MonthBegin(1)
     return start, end
-
-
-def run_sentiment(pipe, texts, batch_size=16):
-    return pipe(texts, batch_size=batch_size, truncation=True)
 
 
 # -------------------------
@@ -94,6 +108,7 @@ if "title" not in reviews_df.columns:
         + "..."
     )
 
+
 # -------------------------
 # Sections
 # -------------------------
@@ -128,16 +143,20 @@ else:
         st.warning("No reviews found for this month in your dataset.")
         st.stop()
 
-    # Load model
-    with st.spinner("Loading sentiment model..."):
-        sent_pipe = load_sentiment_model()
+    # ✅ IMPORTANT: don't load/run model automatically (saves Render memory)
+    run_now = st.button("Run sentiment analysis for this month")
 
-    # Run sentiment
-    with st.spinner("Running sentiment analysis on filtered reviews..."):
-        preds = run_sentiment(sent_pipe, filtered["text"].tolist(), batch_size=16)
+    if not run_now:
+        st.info("Click the button to run sentiment analysis. (Helps avoid memory crashes on free hosting.)")
+        st.stop()
 
-    filtered["sentiment"] = [p.get("label", "") for p in preds]
-    filtered["confidence"] = [float(p.get("score", 0.0)) for p in preds]
+    # Run sentiment with caching
+    with st.spinner("Running sentiment analysis..."):
+        pred_df = run_sentiment_cached(selected, filtered["text"].tolist())
+
+    filtered = filtered.reset_index(drop=True)
+    filtered["sentiment"] = pred_df["sentiment"]
+    filtered["confidence"] = pred_df["confidence"]
 
     # Summary stats (count + avg confidence per sentiment)
     summary = (
@@ -178,5 +197,5 @@ else:
     st.dataframe(avg_conf_by_class, width="stretch")
 
     st.markdown("**Filtered reviews (with predictions)**")
-    show_cols = [c for c in ["date", "title", "text", "sentiment", "confidence"] if c in filtered.columns]
+    show_cols = ["date", "title", "text", "sentiment", "confidence"]
     st.dataframe(filtered[show_cols].sort_values("date", ascending=False), width="stretch")
