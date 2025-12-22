@@ -1,9 +1,9 @@
 import pandas as pd
 import streamlit as st
 import altair as alt
-from transformers import pipeline
 
 DATA_DIR = "data"
+
 
 # -------------------------
 # Caching
@@ -11,43 +11,6 @@ DATA_DIR = "data"
 @st.cache_data
 def load_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
-
-
-@st.cache_resource
-def load_sentiment_model():
-    # Hugging Face Transformer model (po navodilih)
-    return pipeline(
-        "sentiment-analysis",
-        model="distilbert-base-uncased-finetuned-sst-2-english",
-        device=-1  # CPU (Render free)
-    )
-
-
-# -------------------------
-# Sentiment (RAM-safe)
-# -------------------------
-def run_sentiment_chunked(texts: list[str], chunk_size: int = 40) -> pd.DataFrame:
-    """
-    Chunked sentiment inference to avoid exceeding 512MB RAM on Render.
-    No Streamlit caching of predictions.
-    """
-    pipe = load_sentiment_model()
-    rows = []
-
-    for i in range(0, len(texts), chunk_size):
-        chunk = texts[i:i + chunk_size]
-        preds = pipe(
-            chunk,
-            batch_size=4,
-            truncation=True,
-            max_length=128,
-        )
-        rows.extend(preds)
-
-    return pd.DataFrame({
-        "sentiment": [p.get("label", "") for p in rows],
-        "confidence": [float(p.get("score", 0.0)) for p in rows],
-    })
 
 
 # -------------------------
@@ -62,8 +25,8 @@ def available_months_from_data(reviews_df: pd.DataFrame):
     df = reviews_df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"])
-
     df = df[(df["date"] >= "2023-01-01") & (df["date"] < "2024-01-01")]
+
     if df.empty:
         return month_options_2023()
 
@@ -85,8 +48,9 @@ st.set_page_config(page_title="HW3 Brand Reputation Monitor (2023)", layout="wid
 
 st.title("Brand Reputation Monitor (2023)")
 st.caption(
-    "Scrapes Products/Testimonials/Reviews from web-scraping.dev, "
-    "runs Hugging Face Transformer sentiment analysis on 2023 reviews."
+    "Scrapes Products/Testimonials/Reviews from web-scraping.dev. "
+    "Sentiment predictions were precomputed locally using a Hugging Face Transformer model "
+    "and stored in a CSV file for lightweight deployment."
 )
 
 section = st.sidebar.radio("Navigate", ["Products", "Testimonials", "Reviews"])
@@ -94,7 +58,8 @@ section = st.sidebar.radio("Navigate", ["Products", "Testimonials", "Reviews"])
 # Load data
 products_df = load_csv(f"{DATA_DIR}/products.csv")
 testimonials_df = load_csv(f"{DATA_DIR}/testimonials.csv")
-reviews_df = load_csv(f"{DATA_DIR}/reviews.csv")
+# IMPORTANT: this is the enriched file produced locally by precompute_sentiment.py
+reviews_df = load_csv(f"{DATA_DIR}/reviews_with_sentiment.csv")
 
 # Normalize review dates
 if "date" in reviews_df.columns:
@@ -104,20 +69,15 @@ elif "date_raw" in reviews_df.columns:
 else:
     reviews_df["date"] = pd.NaT
 
-# Ensure text/title columns exist
-if "text" not in reviews_df.columns:
-    reviews_df["text"] = ""
+# Ensure required columns exist
+for col in ["text", "title", "sentiment", "confidence"]:
+    if col not in reviews_df.columns:
+        reviews_df[col] = "" if col != "confidence" else 0.0
 
-if "title" not in reviews_df.columns:
-    reviews_df["title"] = (
-        reviews_df["text"]
-        .fillna("")
-        .astype(str)
-        .str.split()
-        .str[:8]
-        .str.join(" ")
-        + "..."
-    )
+reviews_df["text"] = reviews_df["text"].fillna("").astype(str)
+reviews_df["title"] = reviews_df["title"].fillna("").astype(str)
+reviews_df["sentiment"] = reviews_df["sentiment"].fillna("").astype(str).str.upper()
+reviews_df["confidence"] = pd.to_numeric(reviews_df["confidence"], errors="coerce").fillna(0.0)
 
 
 # -------------------------
@@ -126,27 +86,26 @@ if "title" not in reviews_df.columns:
 if section == "Products":
     st.subheader("Products")
     st.write(f"Rows: {len(products_df)}")
-    st.dataframe(products_df, width="stretch")
+    st.dataframe(products_df, use_container_width=True)
 
 elif section == "Testimonials":
     st.subheader("Testimonials")
     st.write(f"Rows: {len(testimonials_df)}")
-    st.dataframe(testimonials_df, width="stretch")
+    st.dataframe(testimonials_df, use_container_width=True)
 
 else:
     st.subheader("Reviews — Sentiment Analysis (2023)")
 
+    # Month selector
     show_all = st.checkbox("Show all months (Jan–Dec 2023)", value=False)
     months = month_options_2023() if show_all else available_months_from_data(reviews_df)
 
     selected = st.select_slider("Select month", options=months, value=months[0])
     start, end = month_to_range(selected)
 
-    filtered = reviews_df[
-        (reviews_df["date"] >= start) & (reviews_df["date"] < end)
-    ].copy()
-
-    filtered["text"] = filtered["text"].fillna("").astype(str)
+    # Filter reviews
+    filtered = reviews_df[(reviews_df["date"] >= start) & (reviews_df["date"] < end)].copy()
+    filtered = filtered.dropna(subset=["date"])
 
     st.write(f"Showing reviews from **{selected}** — rows: **{len(filtered)}**")
 
@@ -154,20 +113,7 @@ else:
         st.warning("No reviews found for this month.")
         st.stop()
 
-    run_now = st.button("Run sentiment analysis for this month")
-
-    if not run_now:
-        st.info("Click the button to run sentiment analysis.")
-        st.stop()
-
-    with st.spinner("Running sentiment analysis..."):
-        pred_df = run_sentiment_chunked(filtered["text"].tolist())
-
-    filtered = filtered.reset_index(drop=True)
-    filtered["sentiment"] = pred_df["sentiment"]
-    filtered["confidence"] = pred_df["confidence"]
-
-    # Summary
+    # Summary: count + avg confidence
     summary = (
         filtered.groupby("sentiment")
         .agg(
@@ -177,32 +123,34 @@ else:
         .reset_index()
     )
 
+    # Ensure both labels appear (nice for chart consistency)
+    wanted = pd.DataFrame({"sentiment": ["POSITIVE", "NEGATIVE"]})
+    summary = wanted.merge(summary, on="sentiment", how="left").fillna({"count": 0, "avg_confidence": 0.0})
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Total reviews", len(filtered))
-    c2.metric("Avg confidence", f"{filtered['confidence'].mean():.3f}")
-    c3.metric("Positive share", f"{filtered['sentiment'].eq('POSITIVE').mean()*100:.1f}%")
+    c2.metric("Avg confidence (overall)", f"{filtered['confidence'].mean():.3f}")
+    c3.metric("Positive share", f"{(filtered['sentiment'].eq('POSITIVE').mean() * 100):.1f}%")
 
-    # Bar chart (Advanced requirement)
+    # Bar chart with avg confidence tooltip (Advanced requirement)
     chart = (
         alt.Chart(summary)
         .mark_bar()
         .encode(
-            x="sentiment:N",
-            y="count:Q",
+            x=alt.X("sentiment:N", title="Sentiment"),
+            y=alt.Y("count:Q", title="Count"),
             tooltip=[
-                "sentiment:N",
-                "count:Q",
-                alt.Tooltip("avg_confidence:Q", format=".3f")
+                alt.Tooltip("sentiment:N", title="Sentiment"),
+                alt.Tooltip("count:Q", title="Count"),
+                alt.Tooltip("avg_confidence:Q", title="Avg confidence", format=".3f"),
             ],
         )
         .properties(height=300)
     )
-
-    st.altair_chart(chart, width="stretch")
+    st.altair_chart(chart, use_container_width=True)
 
     st.markdown("**Filtered reviews (with predictions)**")
     st.dataframe(
-        filtered[["date", "title", "text", "sentiment", "confidence"]]
-        .sort_values("date", ascending=False),
-        width="stretch",
+        filtered[["date", "title", "text", "sentiment", "confidence"]].sort_values("date", ascending=False),
+        use_container_width=True,
     )
