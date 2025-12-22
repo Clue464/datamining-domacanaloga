@@ -6,3 +6,5 @@ torch
 requests
 beautifulsoup4
 lxml
+wordcloud
+matplotlib

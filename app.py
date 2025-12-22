@@ -2,6 +2,10 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+from wordcloud import WordCloud, STOPWORDS
+import matplotlib.pyplot as plt
+import re
+
 DATA_DIR = "data"
 
 
@@ -41,6 +45,24 @@ def month_to_range(label: str):
     return start, end
 
 
+def clean_text_for_wc(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"http\S+|www\.\S+", " ", text)  # remove urls
+    text = re.sub(r"[^a-z0-9ščćžđáéíóúàèìòùäëïöüß\s]", " ", text)  # keep letters/numbers
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def make_wordcloud(text: str, stopwords: set) -> WordCloud:
+    return WordCloud(
+        width=1200,
+        height=500,
+        background_color="white",
+        stopwords=stopwords,
+        collocations=False,
+    ).generate(text)
+
+
 # -------------------------
 # Streamlit UI
 # -------------------------
@@ -58,8 +80,7 @@ section = st.sidebar.radio("Navigate", ["Products", "Testimonials", "Reviews"])
 # Load data
 products_df = load_csv(f"{DATA_DIR}/products.csv")
 testimonials_df = load_csv(f"{DATA_DIR}/testimonials.csv")
-# IMPORTANT: this is the enriched file produced locally by precompute_sentiment.py
-reviews_df = load_csv(f"{DATA_DIR}/reviews_with_sentiment.csv")
+reviews_df = load_csv(f"{DATA_DIR}/reviews_with_sentiment.csv")  # enriched locally
 
 # Normalize review dates
 if "date" in reviews_df.columns:
@@ -113,6 +134,12 @@ else:
         st.warning("No reviews found for this month.")
         st.stop()
 
+    # KPIs
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total reviews", len(filtered))
+    c2.metric("Avg confidence (overall)", f"{filtered['confidence'].mean():.3f}")
+    c3.metric("Positive share", f"{(filtered['sentiment'].eq('POSITIVE').mean() * 100):.1f}%")
+
     # Summary: count + avg confidence
     summary = (
         filtered.groupby("sentiment")
@@ -126,11 +153,6 @@ else:
     # Ensure both labels appear (nice for chart consistency)
     wanted = pd.DataFrame({"sentiment": ["POSITIVE", "NEGATIVE"]})
     summary = wanted.merge(summary, on="sentiment", how="left").fillna({"count": 0, "avg_confidence": 0.0})
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total reviews", len(filtered))
-    c2.metric("Avg confidence (overall)", f"{filtered['confidence'].mean():.3f}")
-    c3.metric("Positive share", f"{(filtered['sentiment'].eq('POSITIVE').mean() * 100):.1f}%")
 
     # Bar chart with avg confidence tooltip (Advanced requirement)
     chart = (
@@ -149,6 +171,34 @@ else:
     )
     st.altair_chart(chart, use_container_width=True)
 
+    # -------------------------
+    # BONUS: Word Cloud
+    # -------------------------
+    st.markdown("### Word Cloud (selected month)")
+
+    wc_text = (
+        filtered["title"].fillna("").astype(str) + " " + filtered["text"].fillna("").astype(str)
+    ).str.cat(sep=" ")
+
+    wc_text = clean_text_for_wc(wc_text)
+
+    custom_stopwords = {
+        "product", "products", "buy", "bought", "use", "used", "using",
+        "would", "also", "really", "one", "like", "get", "got", "just",
+    }
+    stopwords = set(STOPWORDS) | custom_stopwords
+
+    if wc_text.strip():
+        wc = make_wordcloud(wc_text, stopwords)
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.imshow(wc, interpolation="bilinear")
+        ax.axis("off")
+        st.pyplot(fig, clear_figure=True)
+    else:
+        st.info("Not enough text to generate a word cloud for this month.")
+
+    # Table
     st.markdown("**Filtered reviews (with predictions)**")
     st.dataframe(
         filtered[["date", "title", "text", "sentiment", "confidence"]].sort_values("date", ascending=False),
